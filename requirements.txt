@@ -1,0 +1,31 @@
+﻿# --- Core Math & Live WebSocket Streams ---
+websockets==12.0
+pandas==2.0.3
+yfinance==0.2.38
+numpy==1.24.4
+
+# --- Financial AI Sentiment Processing (FinBERT) ---
+transformers==4.30.2
+torch==2.0.1
+
+# --- Browser Automation & Terminal Formatting ---
+selenium==4.19.0
+beautifulsoup4==4.12.3
+colorama==0.4.6
+python-dotenv==1.0.1
+requests==2.31.0
+aiohttp==3.8.5
+
+# --- Angel One SmartAPI & Streamlit UI ---
+smartapi-python==1.5.5
+pyotp==2.8.0
+logzero==1.7.0
+websocket-client==1.6.3
+streamlit==1.30.0
+plotly==5.22.0
+
+# --- Kite Connect WebSocket & Live UI ---
+kiteconnect==4.13.0
+
+# --- Data Processing & Async Support ---
+aiohttp==3.8.5
