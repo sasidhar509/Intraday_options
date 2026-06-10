@@ -27,6 +27,7 @@ from news_api_integration import render_news_radar_widget, fetch_ui_news_data_ma
 from patch_streamlit_strategy import render_strategy_panel
 from agents.brain import StrategyBrainEngine
 _brain = StrategyBrainEngine()   # single shared instance for the whole app
+from agents.backtest_runner import run_backtest_and_module
 
 try:
     import plotly.graph_objects as go
@@ -325,18 +326,48 @@ with st.sidebar:
                                  type="password")
     token_list   = st.text_input(
         "Token List",
-        value=os.getenv("SMARTAPI_TOKEN_LIST", "NIFTY 50=1:99926000,SENSEX=3:99919000"),
-        help="Comma-separated entries like NIFTY 50=1:99926000,SENSEX=3:99919000.",
+        # include NIFTY and BANKNIFTY futures by default so the dashboard
+        # shows both indices and their strategy panels out-of-the-box
+        value=os.getenv("SMARTAPI_TOKEN_LIST", "NIFTY 50=1:99926000,BANKNIFTY=1:260105,SENSEX=3:99919000"),
+        help=(
+            "Format: LABEL=exchangeType:token  "
+            "Common tokens — "
+            "NIFTY 50 index: 1:99926000 | "
+            "SENSEX index: 3:99919000 | "
+            "NIFTY Futures (current month): 1:256265 | "
+            "BANKNIFTY Futures: 1:260105. "
+            "Exchange types: 1=NSE, 2=BSE, 3=BSE_FO, 5=NSE_FO."
+        ),
     )
-    subscription_mode = st.selectbox(
+    # ── Token quick-reference expander so you never have to guess
+    with st.expander("📋 Common SmartAPI Token Reference", expanded=False):
+        st.markdown("""
+| Label | exchangeType | Token | Notes |
+|---|---|---|---|
+| NIFTY 50 Index | 1 | 99926000 | LTP only, no OI |
+| SENSEX Index | 3 | 99919000 | LTP only, no OI |
+| NIFTY Futures (near) | 1 | 256265 | Has OI & volume |
+| BANKNIFTY Futures | 1 | 260105 | Has OI & volume |
+| NIFTY Options (ATM CE) | 2 | Lookup via instruments API | Changes weekly |
+
+**If tick count stays 0:** The token is valid but the exchange feed
+is not sending data. Try switching to NIFTY Futures `1:256265`
+which has active OI and volume — index tokens sometimes return
+LTP only during low-activity periods.
+        """)
+    _MODE_MAP = {"LTP (1)": 1, "Quote (2)": 2, "Snap Quote (3)": 3, "Depth (4)": 4}
+    _mode_label = st.selectbox(
         "Subscription Mode",
-        options={"LTP": 1, "Quote": 2, "Snap Quote": 3, "Depth": 4},
+        options=list(_MODE_MAP.keys()),
         index=0,
+        help="LTP is fastest. Use Snap Quote (3) if you need order book depth.",
     )
+    subscription_mode = _MODE_MAP[_mode_label]   # always an int: 1/2/3/4
     candle_interval = st.selectbox(
         "Candle Interval",
-        ["5s", "15s", "30s", "1min", "3min", "5min"],
-        index=1,
+        ["1min", "5min", "15min", "1day"],
+        index=0,
+        help="Only supported intervals for options strategies: 1min, 5min, 15min and 1day.",
     )
     auto_refresh     = st.checkbox("Live auto refresh", value=True)
     refresh_seconds  = st.number_input("Refresh seconds", min_value=1, max_value=10, value=1, step=1)
@@ -383,10 +414,12 @@ if complete_session:
         st.error("SmartAPI package is not available. Install dependencies with `pip install -r requirements.txt`.")
     else:
         try:
+            # Ensure mode is always int (SmartAPI rejects string modes silently)
+            _safe_mode = int(subscription_mode) if subscription_mode else 1
             st.session_state.agent = SmartApiLiveAgent(
                 api_key=api_key, client_code=client_code,
                 pin=pin, totp_secret=totp_secret,
-                token_list=token_list, mode=subscription_mode,
+                token_list=token_list, mode=_safe_mode,
             )
             st.session_state.agent.login_with_pin(pin)
             st.session_state.agent.start()
@@ -557,6 +590,56 @@ else:
                     brain           = _brain,
                     news_bias       = news_bias,
                 )
+                # Backtest panel integration (run asynchronously)
+                def _start_backtest_async(instruments=None, interval="1day"):
+                    import threading
+                    def _worker():
+                        try:
+                            st.session_state["bt_running"] = True
+                            st.session_state["bt_status"] = "Started"
+                            st.session_state["bt_log"] = ["Backtest started"]
+                            module, res = run_backtest_and_module(instruments=instruments, interval=interval)
+                            st.session_state["bt_result"] = res
+                            st.session_state["bt_status"] = "Finished"
+                            st.session_state["bt_log"].append("Backtest finished successfully")
+                        except Exception as err:
+                            st.session_state["bt_error"] = str(err)
+                            st.session_state["bt_status"] = "Failed"
+                            st.session_state["bt_log"].append(f"Error: {err}")
+                        finally:
+                            st.session_state["bt_running"] = False
+
+                    thread = threading.Thread(target=_worker, daemon=True)
+                    thread.start()
+
+                if "bt_running" not in st.session_state:
+                    st.session_state["bt_running"] = False
+                    st.session_state["bt_status"] = "Idle"
+                    st.session_state["bt_log"] = []
+                    st.session_state["bt_result"] = None
+                    st.session_state["bt_error"] = None
+
+                col_run_a, col_run_b = st.columns([1, 3])
+                with col_run_a:
+                    if st.button("▶ Run Backtest Async"):
+                        if not st.session_state.get("bt_running", False):
+                            _start_backtest_async(instruments=["NIFTY", "BANKNIFTY"], interval="1day")
+                            st.success("Backtest started in background — Refresh panel to see updates.")
+                        else:
+                            st.info("Backtest already running.")
+                with col_run_b:
+                    st.markdown(f"**Status:** {st.session_state.get('bt_status','Idle')}")
+                    if st.session_state.get("bt_log"):
+                        with st.expander("Backtest Log", expanded=False):
+                            for line in st.session_state.get("bt_log", [])[-50:]:
+                                st.text(line)
+
+                # If finished, render results
+                if st.session_state.get("bt_result") is not None:
+                    from agents.backtest_engine import render_backtest_panel
+                    render_backtest_panel(st.session_state.get("bt_result"))
+                if st.session_state.get("bt_error"):
+                    st.error(f"Backtest error: {st.session_state.get('bt_error')}")
 
                 with right:
                     st.subheader("Levels & Pattern")

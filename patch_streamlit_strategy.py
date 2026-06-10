@@ -31,6 +31,7 @@ import os
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from streamlit.components.v1 import html
 
 load_dotenv()
 
@@ -195,15 +196,40 @@ def render_strategy_panel(
                 "Reason"       : row.get("Reason", ""),
             })
 
+        # If the underlying is BANKNIFTY, add a visible badge and inline option premium column
+        underlying_label = label
+        if "BANK" in underlying_label.upper():
+            for r in augmented_rows:
+                # add a compact Option Premium preview column if Option exists
+                opt_text = r.get("Option", "")
+                r["Underlying Badge"] = "BANKNIFTY"
+                r["Option Premium Preview"] = (
+                    f"Entry ₹{r.get('Entry')} | SL ₹{r.get('Stop')} | T {r.get('Target')}"
+                    if r.get("Entry") != "" else "—"
+                )
+
+        # create dataframe and ensure Option Premium Preview is its own column
         df_aug = pd.DataFrame(augmented_rows)
+        if "Option Premium Preview" not in df_aug.columns:
+            df_aug["Option Premium Preview"] = df_aug.apply(
+                lambda r: f"Entry ₹{r['Entry']} | SL ₹{r['Stop']} | T {r['Target']}" if r.get('Entry') not in (None, '') else '—',
+                axis=1,
+            )
 
         # ── Colour-code the Actionable column via background
         def _highlight(row):
-            colour = (
-                "background-color:#E1F5EE"
-                if row["Actionable"] == "✅ YES"
-                else "background-color:#FCEBEB"
-            )
+            # Base colouring by actionable
+            if row.get("Actionable") == "✅ YES":
+                colour = "background-color:#E1F5EE"
+            else:
+                colour = "background-color:#FCEBEB"
+            # Highlight BANKNIFTY rows with a subtle tint override
+            try:
+                if str(row.get("Underlying Badge", "")).upper() == "BANKNIFTY":
+                    # use a distinct light-blue background for BankNifty
+                    colour = "background-color:#E6F4FF"
+            except Exception:
+                pass
             return [colour] * len(row)
 
         styled = df_aug.style.apply(_highlight, axis=1)
@@ -224,6 +250,28 @@ def render_strategy_panel(
                 f"Max Loss: {top['Max Loss ₹']} | "
                 f"Prob: {top['Unified Prob']}"
             )
+            # Provide one-click copy-to-clipboard for the best actionable order
+            contract_text = f"{top['Option']} | Entry ₹{top['Entry']} | SL ₹{top['Stop']} | Target ₹{top['Target']}"
+            # render a small per-row copy UI for the top actionable setup (uses module-level html)
+            safe_text = contract_text.replace('"', '\"')
+            copy_html = f"""
+            <div style='display:flex;gap:6px;align-items:center;'>
+              <input id='contract_top' type='text' value="{safe_text}" style='width:78%;padding:6px;' readonly />
+              <button onclick="navigator.clipboard.writeText(document.getElementById('contract_top').value).then(function(){{alert('Copied to clipboard')}})">Copy Order</button>
+            </div>
+            """
+            try:
+                html(copy_html)
+            except Exception:
+                st.code(contract_text)
+
+        # Add per-row copy buttons below the dataframe using HTML table for simplicity
+        if not df_aug.empty:
+            with st.expander("Copy individual orders", expanded=False):
+                for _, row in df_aug.iterrows():
+                    contract = f"{row.get('Option','')} | Entry ₹{row.get('Entry','')} | SL ₹{row.get('Stop','')} | Target ₹{row.get('Target','')}"
+                    safe = str(contract).replace('"', '\"')
+                    html(f"<div style='margin-bottom:6px;display:flex;gap:8px;'><input type='text' value=\"{safe}\" style='width:80%;padding:6px;' readonly /><button onclick=\"navigator.clipboard.writeText('{safe}').then(function(){{alert('Copied to clipboard')}})\">Copy</button></div>")
         else:
             st.warning(
                 f"🚫 No strategy meets the entry threshold. "

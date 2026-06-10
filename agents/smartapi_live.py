@@ -127,7 +127,8 @@ class SmartApiLiveAgent:
     @staticmethod
     def _parse_token_list(token_string):
         if not token_string:
-            token_string = "NIFTY 50=1:99926000,SENSEX=3:99919000"
+            # include BANKNIFTY futures by default so dashboard shows Bank Nifty
+            token_string = "NIFTY 50=1:99926000,BANKNIFTY=1:260105,SENSEX=3:99919000"
         cleaned = [part.strip() for part in token_string.split(",") if part.strip()]
         token_groups = []
         for entry in cleaned:
@@ -301,9 +302,11 @@ class SmartApiLiveAgent:
     def _on_error(self, wsapp, error):
         self.connected = False
         self.last_error = str(error)
+        print(f"WebSocket error: {error}")
 
     def _on_close(self, wsapp, *args):
         self.connected = False
+        print("WebSocket connection closed")
 
     def _on_message(self, wsapp, message):
         self.raw_message_count += 1
@@ -339,7 +342,9 @@ class SimulatedSmartApiLiveAgent:
     """Fallback simulated live stream for SmartAPI UI testing without credentials."""
 
     def __init__(self, tokens=None):
-        self.tokens = [token.strip() for token in (tokens or os.getenv("SMARTAPI_TOKEN_LIST", "26009")).split(",") if token.strip()]
+        # default to a small set that includes BANKNIFTY futures (260105) for UI testing
+        default_tokens = os.getenv("SMARTAPI_TOKEN_LIST", "260105,256265,99926000")
+        self.tokens = [token.strip() for token in (tokens or default_tokens).split(",") if token.strip()]
         self.strategy = StrategyBrainEngine()
         self.live_state = {}
         self.price_history = {}
