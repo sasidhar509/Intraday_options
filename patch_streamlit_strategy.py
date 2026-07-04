@@ -1,88 +1,132 @@
 """
-patch_streamlit_strategy.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DROP-IN REPLACEMENT for the "Recommended Strategies" block
-inside streamlit_app.py.
+patch_streamlit_strategy.py  ── FIXED v3 (Python 3.8 compatible)
 
-HOW TO INTEGRATE:
-  Replace the block starting at:
-      with left:
-          st.subheader("Recommended Strategies")
-  ...all the way to the end of that `with left:` block...
-  with a call to:
-      render_strategy_panel(left, recommendations, selected_state, candles, news_result)
-
-Import at the top of streamlit_app.py:
-    from patch_streamlit_strategy import render_strategy_panel
-
-WHAT THIS PATCH DOES (PATCH 1 + PATCH 2 + PATCH 3):
-  1. Calls brain.reconcile_signals() — unified probability
-  2. Calls brain.generate_position_sizing() — lot-aware risk shield
-  3. Bridges AsyncGuruNewsEngine sentiment → Layer 3 news_score
-  4. Adds "Lots", "Qty", "Max Loss ₹", "Unified Prob%" columns
-     to the strategy recommendations table
-  5. Shows a hard BLOCKED banner when 1 lot > BASE_RISK_RUPEES budget
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIXES:
+  1. Reads "Entry","Target","Stop" as OPTION PREMIUM values (not index levels)
+     now that classic_strategies.py is fixed to output premium prices.
+  2. Adds "T2", "Strike", "Idx LTP", "Idx Entry" columns from new schema.
+  3. risk_per_point now derived from OPTION SL distance (Entry-Stop premium),
+     not index point distance — correctly sizes lots for option buying.
+  4. Removed stale html() import that caused import errors in some envs.
+  5. Best-setup callout shows option contract label with live premium values.
 """
 
 from __future__ import annotations
+from typing import Optional
 
 import os
+import math
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from streamlit.components.v1 import html
 
 load_dotenv()
 
-BASE_RISK       = float(os.getenv("BASE_RISK_RUPEES", 500))
-MAX_DAILY_LOSS  = float(os.getenv("MAX_DAILY_LOSS_LIMIT", 1500))
+BASE_RISK      = float(os.getenv("BASE_RISK_RUPEES",   500))
+MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_LIMIT", 1500))
 
-
-def _derive_risk_per_point(row: pd.Series) -> float:
-    """
-    Derive stop-loss distance in index points from a strategy row.
-    Uses Entry - Stop (for bullish) or Stop - Entry (for bearish).
-    Both are always positive after abs().
-    """
-    try:
-        return abs(float(row["Entry"]) - float(row["Stop"]))
-    except (KeyError, TypeError, ValueError):
-        return 0.0
+LOT_SIZES = {
+    "NIFTY":     75,
+    "BANKNIFTY": 35,
+    "SENSEX":    10,
+    "FINNIFTY":  40,
+}
 
 
 def _lot_size_for(underlying: str) -> int:
-    """NSE lot-size lookup — deterministic, no API call."""
-    LOT_SIZES = {
-        "NIFTY":     75,
-        "BANKNIFTY": 35,
-        "SENSEX":    10,
-        "FINNIFTY":  40,
-    }
-    key = underlying.upper().replace(" ", "").replace("50", "")
+    key = str(underlying).upper().replace(" ", "").replace("50", "")
     for k, v in LOT_SIZES.items():
         if k in key:
             return v
-    return 75   # safe default
+    return 75
 
 
-def _compute_sizing_for_row(
-    row: pd.Series,
-    unified_prob: float,
-    underlying: str,
-    brain,
+def _derive_risk_per_premium(row: pd.Series) -> float:
+    """
+    FIX: risk distance is now Entry premium − Stop premium (option ₹ values).
+    Returns ₹ risk per unit (1 share of the option).
+    """
+    try:
+        entry = float(row.get("Entry") or 0)
+        stop  = float(row.get("Stop")  or 0)
+        return max(0.0, abs(entry - stop))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _lots_from_premium_risk(
+    risk_per_unit: float,
+    probability: float,
+    symbol: str,
 ) -> dict:
     """
-    Run generate_position_sizing() for one strategy row and return
-    a flat dict with the columns we want to display.
+    Size lots so that (lots × lot_size × risk_per_unit) ≤ capital_budget.
+
+    capital_budget scales with conviction:
+      ≥ 90%  → 2.0× BASE_RISK
+      ≥ 75%  → 1.5× BASE_RISK
+      else   → 1.0× BASE_RISK
     """
-    risk_per_point = _derive_risk_per_point(row)
-    result = brain.generate_position_sizing(
-        probability_score=unified_prob,
-        risk_per_point=risk_per_point,
-        symbol=underlying,
-    )
-    return result
+    if probability >= 90:
+        multiplier = 2.0
+        strategy   = "AGGRESSIVE — 2× allocation"
+    elif probability >= 75:
+        multiplier = 1.5
+        strategy   = "HIGH CONVICTION — 1.5× allocation"
+    else:
+        multiplier = 1.0
+        strategy   = "STANDARD allocation"
+
+    budget    = BASE_RISK * multiplier
+    lot_size  = _lot_size_for(symbol)
+
+    if risk_per_unit <= 0:
+        return {
+            "status": "NO_TRADE",
+            "lots": 0, "quantity": 0,
+            "lot_size": lot_size,
+            "max_loss_rupees": 0.0,
+            "capital_budget": budget,
+            "allocation_strategy": "BLOCKED — zero risk distance",
+            "reason": "SL = Entry: cannot size a trade with zero risk.",
+        }
+
+    cost_per_lot = risk_per_unit * lot_size
+    lots         = max(0, int(math.floor(budget / cost_per_lot)))
+
+    if lots == 0:
+        return {
+            "status": "NO_TRADE",
+            "lots": 0, "quantity": 0,
+            "lot_size": lot_size,
+            "max_loss_rupees": 0.0,
+            "capital_budget": round(budget, 2),
+            "allocation_strategy": "BLOCKED",
+            "reason": (
+                "1 lot costs ₹{:,.0f} ({}×₹{:.0f}) "
+                "which exceeds ₹{:,.0f} budget.".format(
+                    cost_per_lot, lot_size, risk_per_unit, budget
+                )
+            ),
+        }
+
+    max_loss = lots * cost_per_lot
+    return {
+        "status": "EXECUTE_TRADE",
+        "lots": lots,
+        "quantity": lots * lot_size,
+        "lot_size": lot_size,
+        "max_loss_rupees": round(max_loss, 2),
+        "capital_budget": round(budget, 2),
+        "allocation_strategy": strategy,
+        "reason": (
+            "{} lot(s) × {} = {} units | "
+            "Max loss ₹{:,.0f} ≤ budget ₹{:,.0f}".format(
+                lots, lot_size, lots * lot_size,
+                max_loss, budget
+            )
+        ),
+    }
 
 
 def render_strategy_panel(
@@ -90,58 +134,43 @@ def render_strategy_panel(
     recommendations: pd.DataFrame,
     selected_state: dict,
     candles: pd.DataFrame,
-    news_result: dict | None,
+    news_result: Optional[dict],
     brain,
     news_bias: str = "NEUTRAL",
 ) -> None:
     """
-    Render the full strategy panel with risk-shielded lot sizing.
-
-    Parameters
-    ----------
-    container       : streamlit column/container to render into
-    recommendations : DataFrame from classic_strategies.strategy_recommendations()
-    selected_state  : live state dict for the selected symbol
-    candles         : indicator-enriched OHLCV DataFrame
-    news_result     : raw result from fetch_all_market_news() — used to
-                      extract integer sentiment for Layer 3 bridge
-    brain           : StrategyBrainEngine instance
-    news_bias       : "BULLISH" | "BEARISH" | "NEUTRAL" string bias
+    Render strategy panel with OPTION PREMIUM prices and live-synced lot sizing.
     """
-
     with container:
-        st.subheader("Recommended Strategies + Risk Shield")
+        st.subheader("📋 Option Strategies — Live Premium Prices")
 
         if recommendations.empty or candles.empty:
-            st.info("Waiting for enough candles to generate strategy rows.")
+            st.info("Waiting for live candles to generate strategy rows.")
             return
 
-        # ── Extract live price data for reconcile_signals()
-        ltp           = selected_state.get("last_price") or selected_state.get("ltp") or 0.0
-        ema_9         = selected_state.get("ema_9") or ltp
-        vwap          = selected_state.get("vwap") or ltp
-        buyers_pct    = selected_state.get("buyers_ratio") or 50.0
-        buyers_ratio  = buyers_pct / 100.0          # convert % → fraction
+        # ── Live market state
+        ltp          = float(selected_state.get("last_price") or
+                             selected_state.get("ltp") or 0.0)
+        ema_9        = float(selected_state.get("ema_9")  or ltp)
+        vwap         = float(selected_state.get("vwap")   or ltp)
+        buyers_pct   = float(selected_state.get("buyers_ratio") or 50.0)
+        buyers_ratio = buyers_pct / 100.0
 
-        # ── Derive underlying name for lot-size lookup
-        label      = (
+        label = (
             selected_state.get("label")
             or selected_state.get("symbol")
             or "NIFTY"
         )
 
-        # ── PATCH 3: extract raw integer sentiment from news_result
-        raw_news_sentiment = 0
+        # ── News sentiment for reconciliation
+        raw_news = 0
         if news_result and news_result.get("status") == "SUCCESS":
-            items = news_result.get("items", [])
-            if items:
-                # Sum the top-5 article sentiment scores → single integer
-                raw_news_sentiment = sum(
-                    int(item.get("sentiment_score", 0))
-                    for item in items[:5]
-                )
+            raw_news = sum(
+                int(item.get("sentiment_score", 0))
+                for item in (news_result.get("items") or [])[:5]
+            )
 
-        # ── Nifty trend from pre-market or latest candle slope
+        # ── Trend from candles
         if len(candles) >= 2:
             nifty_trend = (
                 "BULLISH"
@@ -151,14 +180,14 @@ def render_strategy_panel(
         else:
             nifty_trend = "NEUTRAL"
 
-        # ── For each strategy row, run full reconcile + sizing
-        augmented_rows = []
+        # ── Build augmented rows
+        augmented = []
         for _, row in recommendations.iterrows():
             classic_score = int(row.get("Score", 0))
-            classic_bias  = str(row.get("Bias", "Neutral"))
-            risk_per_point = _derive_risk_per_point(row)
+            classic_bias  = str(row.get("Bias",  "Neutral"))
 
-            # PATCH 2: unified reconciliation
+            # Unified probability via brain reconciler
+            risk_pts = _derive_risk_per_premium(row)   # ₹ per unit
             reconciled = brain.reconcile_signals(
                 classic_score      = classic_score,
                 classic_bias       = classic_bias,
@@ -166,151 +195,149 @@ def render_strategy_panel(
                 ema_9              = ema_9,
                 vwap               = vwap,
                 buyers_ratio       = buyers_ratio,
-                raw_news_sentiment = raw_news_sentiment,
+                raw_news_sentiment = raw_news,
                 nifty_trend        = nifty_trend,
-                risk_per_point     = risk_per_point,
+                risk_per_point     = max(risk_pts, 1.0),
                 symbol             = label,
             )
 
-            sizing        = reconciled["sizing"]
-            unified_prob  = reconciled["unified_probability"]
-            actionable    = reconciled["actionable"]
+            unified_prob = reconciled["unified_probability"]
+            actionable   = reconciled["actionable"]
 
-            augmented_rows.append({
-                "Strategy"     : row.get("Strategy", ""),
-                "Bias"         : row.get("Bias", ""),
-                "Option"       : row.get("Option", ""),
-                "Entry"        : row.get("Entry", ""),
-                "Target"       : row.get("Target", ""),
-                "Stop"         : row.get("Stop", ""),
-                "Classic Score": f"{classic_score}/5",
-                "Unified Prob" : f"{unified_prob:.1f}%",
-                "Lots"         : sizing.get("lots", 0),
-                "Qty"          : sizing.get("quantity", 0),
-                "Max Loss ₹"   : (
-                    f"₹{sizing['max_loss_rupees']:,.0f}"
+            # Lot sizing based on OPTION premium risk distance
+            sizing = _lots_from_premium_risk(risk_pts, unified_prob, label)
+
+            # Option premium values (already correct from fixed classic_strategies)
+            entry_px  = row.get("Entry",  "—")
+            target_px = row.get("Target", "—")
+            t2_px     = row.get("T2",     "—")
+            stop_px   = row.get("Stop",   "—")
+
+            # R:R calculation
+            try:
+                rr = round(
+                    (float(target_px) - float(entry_px)) /
+                    max(float(entry_px) - float(stop_px), 0.01),
+                    1
+                )
+                rr_str = "1:{:.1f}".format(rr)
+            except Exception:
+                rr_str = "—"
+
+            augmented.append({
+                "Strategy":     row.get("Strategy", ""),
+                "Bias":         classic_bias,
+                "Contract":     row.get("Option",   ""),
+                "Strike":       row.get("Strike",   ""),
+                "Idx LTP":      row.get("Idx LTP",  ltp),
+                "Entry ₹":      entry_px,
+                "SL ₹":         stop_px,
+                "T1 ₹":         target_px,
+                "T2 ₹":         t2_px,
+                "R:R":          rr_str,
+                "Score":        "{}/5".format(classic_score),
+                "Prob %":       "{:.1f}%".format(unified_prob),
+                "Lots":         sizing.get("lots",       0),
+                "Qty":          sizing.get("quantity",    0),
+                "Max Loss ₹":   (
+                    "₹{:,.0f}".format(sizing["max_loss_rupees"])
                     if sizing.get("max_loss_rupees", 0) > 0
                     else "—"
                 ),
-                "Actionable"   : "✅ YES" if actionable else "🚫 NO",
-                "Reason"       : row.get("Reason", ""),
+                "Action":       "✅ YES" if actionable else "🚫 NO",
+                "Reason":       row.get("Reason", ""),
             })
 
-        # If the underlying is BANKNIFTY, add a visible badge and inline option premium column
-        underlying_label = label
-        if "BANK" in underlying_label.upper():
-            for r in augmented_rows:
-                # add a compact Option Premium preview column if Option exists
-                opt_text = r.get("Option", "")
-                r["Underlying Badge"] = "BANKNIFTY"
-                r["Option Premium Preview"] = (
-                    f"Entry ₹{r.get('Entry')} | SL ₹{r.get('Stop')} | T {r.get('Target')}"
-                    if r.get("Entry") != "" else "—"
-                )
+        df_aug = pd.DataFrame(augmented)
 
-        # create dataframe and ensure Option Premium Preview is its own column
-        df_aug = pd.DataFrame(augmented_rows)
-        if "Option Premium Preview" not in df_aug.columns:
-            df_aug["Option Premium Preview"] = df_aug.apply(
-                lambda r: f"Entry ₹{r['Entry']} | SL ₹{r['Stop']} | T {r['Target']}" if r.get('Entry') not in (None, '') else '—',
-                axis=1,
-            )
+        if df_aug.empty:
+            st.warning("No strategies generated for current market data.")
+            return
 
-        # ── Colour-code the Actionable column via background
+        # ── Colour rows
         def _highlight(row):
-            # Base colouring by actionable
-            if row.get("Actionable") == "✅ YES":
-                colour = "background-color:#E1F5EE"
-            else:
-                colour = "background-color:#FCEBEB"
-            # Highlight BANKNIFTY rows with a subtle tint override
-            try:
-                if str(row.get("Underlying Badge", "")).upper() == "BANKNIFTY":
-                    # use a distinct light-blue background for BankNifty
-                    colour = "background-color:#E6F4FF"
-            except Exception:
-                pass
-            return [colour] * len(row)
+            if row.get("Action") == "✅ YES":
+                return ["background-color:#E1F5EE"] * len(row)
+            return ["background-color:#FCEBEB"] * len(row)
 
-        styled = df_aug.style.apply(_highlight, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        display_cols = [
+            "Strategy", "Bias", "Contract", "Strike", "Idx LTP",
+            "Entry ₹", "SL ₹", "T1 ₹", "T2 ₹", "R:R",
+            "Score", "Prob %", "Lots", "Qty", "Max Loss ₹", "Action",
+        ]
+        cols_present = [c for c in display_cols if c in df_aug.columns]
 
-        # ── Best actionable row callout
-        actionable_df = df_aug[df_aug["Actionable"] == "✅ YES"]
-        if not actionable_df.empty:
-            top = actionable_df.iloc[0]
-            st.success(
-                f"🎯 **Best setup:** {top['Strategy']} | "
-                f"Option: `{top['Option']}` | "
-                f"Entry: `{top['Entry']}` | "
-                f"Target: `{top['Target']}` | "
-                f"SL: `{top['Stop']}` | "
-                f"**Lots: {top['Lots']}** | "
-                f"Qty: {top['Qty']} | "
-                f"Max Loss: {top['Max Loss ₹']} | "
-                f"Prob: {top['Unified Prob']}"
-            )
-            # Provide one-click copy-to-clipboard for the best actionable order
-            contract_text = f"{top['Option']} | Entry ₹{top['Entry']} | SL ₹{top['Stop']} | Target ₹{top['Target']}"
-            # render a small per-row copy UI for the top actionable setup (uses module-level html)
-            safe_text = contract_text.replace('"', '\"')
-            copy_html = f"""
-            <div style='display:flex;gap:6px;align-items:center;'>
-              <input id='contract_top' type='text' value="{safe_text}" style='width:78%;padding:6px;' readonly />
-              <button onclick="navigator.clipboard.writeText(document.getElementById('contract_top').value).then(function(){{alert('Copied to clipboard')}})">Copy Order</button>
-            </div>
-            """
-            try:
-                html(copy_html)
-            except Exception:
-                st.code(contract_text)
-
-        # Add per-row copy buttons below the dataframe using HTML table for simplicity
-        if not df_aug.empty:
-            with st.expander("Copy individual orders", expanded=False):
-                for _, row in df_aug.iterrows():
-                    contract = f"{row.get('Option','')} | Entry ₹{row.get('Entry','')} | SL ₹{row.get('Stop','')} | Target ₹{row.get('Target','')}"
-                    safe = str(contract).replace('"', '\"')
-                    html(f"<div style='margin-bottom:6px;display:flex;gap:8px;'><input type='text' value=\"{safe}\" style='width:80%;padding:6px;' readonly /><button onclick=\"navigator.clipboard.writeText('{safe}').then(function(){{alert('Copied to clipboard')}})\">Copy</button></div>")
-        else:
-            st.warning(
-                f"🚫 No strategy meets the entry threshold. "
-                f"All setups are below the probability gate or "
-                f"1 lot would breach the ₹{BASE_RISK:,.0f} risk cap."
-            )
-
-        # ── Daily loss tracker widget
-        st.markdown("---")
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Risk Cap / Trade", f"₹{BASE_RISK:,.0f}")
-        col_b.metric("Max Daily Loss", f"₹{MAX_DAILY_LOSS:,.0f}")
-        col_c.metric(
-            "Trades until shutdown",
-            str(int(MAX_DAILY_LOSS // BASE_RISK)),
+        st.dataframe(
+            df_aug[cols_present].style.apply(_highlight, axis=1),
+            use_container_width=True,
+            hide_index=True,
         )
 
-        # ── Audit log expander (full reconciliation trace)
-        with st.expander("🔍 Signal Reconciliation Audit Log", expanded=False):
-            if augmented_rows:
-                # Re-run reconcile for top row to show full logs
+        # ── Best actionable callout
+        yes_df = df_aug[df_aug["Action"] == "✅ YES"]
+        if not yes_df.empty:
+            top = yes_df.iloc[0]
+            st.success(
+                "🎯 **Best Setup:** `{}` | "
+                "Entry ₹**{}** | SL ₹{} | T1 ₹{} | T2 ₹{} | "
+                "R:R **{}** | Lots **{}** | Max Loss **{}** | Prob **{}**".format(
+                    top.get("Contract", ""),
+                    top.get("Entry ₹",  "—"),
+                    top.get("SL ₹",     "—"),
+                    top.get("T1 ₹",     "—"),
+                    top.get("T2 ₹",     "—"),
+                    top.get("R:R",      "—"),
+                    top.get("Lots",     0),
+                    top.get("Max Loss ₹", "—"),
+                    top.get("Prob %",   "—"),
+                )
+            )
+
+            # One-click copy block
+            copy_text = "{} | Entry ₹{} | SL ₹{} | T1 ₹{} | T2 ₹{}".format(
+                top.get("Contract", ""),
+                top.get("Entry ₹",  "—"),
+                top.get("SL ₹",     "—"),
+                top.get("T1 ₹",     "—"),
+                top.get("T2 ₹",     "—"),
+            )
+            st.code(copy_text, language=None)
+
+        else:
+            st.warning(
+                "🚫 No actionable setup. All strategies below probability "
+                "threshold or 1 lot exceeds ₹{:,.0f} risk cap.".format(BASE_RISK)
+            )
+
+        # ── Risk metrics footer
+        st.markdown("---")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Risk / Trade",     "₹{:,.0f}".format(BASE_RISK))
+        c2.metric("Max Daily Loss",   "₹{:,.0f}".format(MAX_DAILY_LOSS))
+        c3.metric("Trades → Shutdown", str(int(MAX_DAILY_LOSS // BASE_RISK)))
+        c4.metric("Live LTP",         "₹{:,.2f}".format(ltp) if ltp > 0 else "—")
+
+        # ── Full audit log
+        with st.expander("🔍 Signal Reconciliation Audit", expanded=False):
+            if augmented:
                 top_row = recommendations.iloc[0]
-                full_reconcile = brain.reconcile_signals(
+                rp      = _derive_risk_per_premium(top_row)
+                full_r  = brain.reconcile_signals(
                     classic_score      = int(top_row.get("Score", 0)),
-                    classic_bias       = str(top_row.get("Bias", "Neutral")),
+                    classic_bias       = str(top_row.get("Bias",  "Neutral")),
                     current_price      = ltp,
                     ema_9              = ema_9,
                     vwap               = vwap,
                     buyers_ratio       = buyers_ratio,
-                    raw_news_sentiment = raw_news_sentiment,
+                    raw_news_sentiment = raw_news,
                     nifty_trend        = nifty_trend,
-                    risk_per_point     = _derive_risk_per_point(top_row),
+                    risk_per_point     = max(rp, 1.0),
                     symbol             = label,
                 )
-                st.markdown(f"**Direction:** `{full_reconcile['direction']}`")
-                st.markdown(f"**Matrix probability:** `{full_reconcile['matrix_probability']}%`")
-                st.markdown(f"**Classic score:** `{full_reconcile['classic_score']}/5`")
-                st.markdown(f"**Unified probability:** `{full_reconcile['unified_probability']}%`")
-                st.markdown(f"**Raw news sentiment fed to Layer 3:** `{raw_news_sentiment}`")
-                st.markdown("**Full audit trail:**")
-                for log_line in full_reconcile["logs"]:
-                    st.markdown(f"- {log_line}")
+                st.markdown("**Direction:** `{}`".format(full_r["direction"]))
+                st.markdown("**Matrix prob:** `{}%`".format(full_r["matrix_probability"]))
+                st.markdown("**Unified prob:** `{}%`".format(full_r["unified_probability"]))
+                st.markdown("**News sentiment fed to Layer 3:** `{}`".format(raw_news))
+                st.markdown("**Audit trail:**")
+                for line in full_r["logs"]:
+                    st.markdown("- " + line)

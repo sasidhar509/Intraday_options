@@ -27,7 +27,20 @@ from news_api_integration import render_news_radar_widget, fetch_ui_news_data_ma
 from patch_streamlit_strategy import render_strategy_panel
 from agents.brain import StrategyBrainEngine
 _brain = StrategyBrainEngine()   # single shared instance for the whole app
-from agents.backtest_runner import run_backtest_and_module
+
+# ── Backtest imports (lazy — only loaded when user clicks Run Backtest)
+try:
+    from agents.backtest_runner import run_backtest_and_module
+    BACKTEST_AVAILABLE = True
+except Exception:
+    BACKTEST_AVAILABLE = False
+
+# ── GHOST strategy engine (single best strategy — SMC + liquidity sweep)
+try:
+    from agents.ghost_strategy import GhostStrategyEngine, render_ghost_panel, DailyRiskGuard
+    GHOST_AVAILABLE = True
+except Exception:
+    GHOST_AVAILABLE = False
 
 try:
     import plotly.graph_objects as go
@@ -59,7 +72,7 @@ def market_status():
 
 
 @st.cache_data(ttl=60)
-def fetch_all_market_news(query):
+def fetch_all_market_news(query=None):
     import asyncio
     from news_api_integration import AsyncGuruNewsEngine
     engine = AsyncGuruNewsEngine()
@@ -210,88 +223,584 @@ def render_news_dashboard(news_query):
     return news_result, news_bias
 
 
-def build_trading_chart(candles, symbol):
-    lines   = trendlines(candles)
-    chart_df = candles.copy()
-    x_values = chart_df["timestamp"]
+def build_trading_chart(candles, symbol, ghost_signal=None,
+                        show_ema=False, show_vwap=False, show_sr=False):
+    """
+    Clean Kite-style candlestick chart.
+    - White background, Kite teal/red candles
+    - Volume bars below (replaces RSI subplot)
+    - Optional EMA/VWAP/S-R toggles (off by default)
+    - GHOST overlays: PDH/PDL, OB zone, Entry/SL/T1/T2/T3 lines
+    """
+    df = candles.copy()
+    xs = df["timestamp"]
+
+    KITE_UP   = "#26a69a"
+    KITE_DOWN = "#ef5350"
+    GRID_CLR  = "rgba(0,0,0,0.06)"
+    FONT_CLR  = "#131722"
+
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.72, 0.28],
+        vertical_spacing=0.03,
+        row_heights=[0.78, 0.22],
     )
+
+    # Candlestick
     fig.add_trace(
         go.Candlestick(
-            x=x_values,
-            open=chart_df["open"], high=chart_df["high"],
-            low=chart_df["low"],  close=chart_df["close"],
+            x=xs,
+            open=df["open"], high=df["high"],
+            low=df["low"],   close=df["close"],
             name=symbol,
+            increasing=dict(line=dict(color=KITE_UP,   width=1), fillcolor=KITE_UP),
+            decreasing=dict(line=dict(color=KITE_DOWN, width=1), fillcolor=KITE_DOWN),
+            whiskerwidth=0,
+            showlegend=False,
         ),
         row=1, col=1,
     )
-    for column, color in [
-        ("ema_9",  "#2563eb"),
-        ("ema_20", "#f59e0b"),
-        ("vwap",   "#7c3aed"),
-    ]:
-        if column in chart_df:
-            fig.add_trace(
-                go.Scatter(
-                    x=x_values, y=chart_df[column],
-                    mode="lines", name=column.upper(),
-                    line={"width": 1.4, "color": color},
-                ),
-                row=1, col=1,
-            )
 
-    for column, color, dash in [
-        ("support",    "#16a34a", "dot"),
-        ("resistance", "#dc2626", "dot"),
-        ("s1",         "#22c55e", "dash"),
-        ("r1",         "#ef4444", "dash"),
-    ]:
-        value = (
-            chart_df[column].dropna().iloc[-1]
-            if column in chart_df and not chart_df[column].dropna().empty
-            else None
-        )
-        if value is not None:
-            fig.add_hline(
-                y=float(value), line_dash=dash, line_color=color,
-                annotation_text=column.upper(), row=1, col=1,
-            )
-
-    if lines["support_line"] is not None and lines["resistance_line"] is not None:
-        fig.add_hline(
-            y=lines["support_line"], line_dash="longdash", line_color="#059669",
-            annotation_text="Trend Support", row=1, col=1,
-        )
-        fig.add_hline(
-            y=lines["resistance_line"], line_dash="longdash", line_color="#b91c1c",
-            annotation_text="Trend Resistance", row=1, col=1,
+    # Volume bars
+    vol_col = "volume" if "volume" in df.columns else "Volume" if "Volume" in df.columns else None
+    if vol_col:
+        bar_colors = [KITE_UP if c >= o else KITE_DOWN
+                      for c, o in zip(df["close"], df["open"])]
+        fig.add_trace(
+            go.Bar(x=xs, y=df[vol_col], name="Volume",
+                   marker_color=bar_colors, marker_line_width=0,
+                   opacity=0.55, showlegend=False),
+            row=2, col=1,
         )
 
-    fig.add_trace(
-        go.Scatter(
-            x=x_values, y=chart_df["rsi_14"],
-            mode="lines", name="RSI 14",
-            line={"color": "#334155"},
-        ),
-        row=2, col=1,
-    )
-    fig.add_hline(y=70, line_dash="dot", line_color="#dc2626", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="#16a34a", row=2, col=1)
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="RSI",   range=[0, 100], row=2, col=1)
+    # Optional: EMA lines
+    if show_ema:
+        for col, color, label in [("ema_9","#2563eb","EMA 9"),("ema_20","#f59e0b","EMA 20")]:
+            if col in df.columns:
+                fig.add_trace(go.Scatter(x=xs, y=df[col], mode="lines", name=label,
+                    line=dict(width=1.2, color=color)), row=1, col=1)
+
+    # Optional: VWAP
+    if show_vwap and "vwap" in df.columns:
+        fig.add_trace(go.Scatter(x=xs, y=df["vwap"], mode="lines", name="VWAP",
+            line=dict(width=1.2, color="#7c3aed", dash="dot")), row=1, col=1)
+
+    # Optional: Support / Resistance
+    if show_sr:
+        for col, color, dash in [("support","#16a34a","dot"),("resistance","#dc2626","dot")]:
+            val = df[col].dropna().iloc[-1] if col in df.columns and not df[col].dropna().empty else None
+            if val:
+                fig.add_hline(y=float(val), line_dash=dash, line_color=color, line_width=1,
+                    annotation_text=col.upper(), annotation_font_size=10, row=1, col=1)
+
+    # GHOST overlays
+    if ghost_signal is not None:
+        sig = ghost_signal
+
+        # PDH / PDL — thin dashed grey
+        for level, label in [(sig.pdh, "PDH"), (sig.pdl, "PDL")]:
+            if level:
+                fig.add_hline(y=level, line_dash="dash", line_color="#90a4ae", line_width=1,
+                    annotation_text=f"{label} {level:.0f}", annotation_font_size=10,
+                    annotation_font_color="#546e7a", annotation_position="right", row=1, col=1)
+
+        # VWAP line from signal
+        if sig.vwap and sig.vwap > 0:
+            vwap_color = "#7c3aed"
+            fig.add_hline(y=sig.vwap, line_dash="dash", line_color=vwap_color, line_width=1.2,
+                annotation_text=f"VWAP {sig.vwap:.0f}",
+                annotation_font_size=10, annotation_font_color=vwap_color,
+                annotation_position="right", row=1, col=1)
+
+        # OB zone — amber shading
+        if sig.ob_high and sig.ob_low and sig.ob_high > 0:
+            fig.add_hrect(y0=sig.ob_low, y1=sig.ob_high,
+                fillcolor="rgba(255,152,0,0.10)", line_width=0.8,
+                line_color="rgba(255,152,0,0.5)",
+                annotation_text="OB", annotation_position="right",
+                annotation_font_size=10, annotation_font_color="#e65100",
+                row=1, col=1)
+
+        # Entry / SL / Targets — only when actionable
+        if sig.actionable:
+            entry_idx = getattr(sig, "entry_idx", None) or sig.trap_level
+            sl_idx    = getattr(sig, "sl_idx", None)
+            t1_idx    = getattr(sig, "t1_idx", None)
+            t2_idx    = getattr(sig, "t2_idx", None)
+            t3_idx    = getattr(sig, "t3_idx", None)
+
+            if entry_idx:
+                fig.add_hline(y=entry_idx, line_dash="solid", line_color="#1565c0", line_width=1.8,
+                    annotation_text=f"Entry {entry_idx:.0f}", annotation_font_size=10,
+                    annotation_font_color="#1565c0", annotation_position="right", row=1, col=1)
+            if sl_idx:
+                fig.add_hline(y=sl_idx, line_dash="dash", line_color="#c62828", line_width=1.5,
+                    annotation_text=f"SL {sl_idx:.0f}", annotation_font_size=10,
+                    annotation_font_color="#c62828", annotation_position="right", row=1, col=1)
+            for level, label, color in [
+                (t1_idx, f"T1 {t1_idx:.0f}  ({getattr(sig,'rr_t1','1:2')})" if t1_idx else None, "#2e7d32"),
+                (t2_idx, f"T2 {t2_idx:.0f}  ({getattr(sig,'rr_t2','1:3')})" if t2_idx else None, "#1b5e20"),
+                (t3_idx, f"T3 {t3_idx:.0f}  ({getattr(sig,'rr_t3','1:5')})" if t3_idx else None, "#003300"),
+            ]:
+                if level and label:
+                    fig.add_hline(y=level, line_dash="dot", line_color=color, line_width=1.2,
+                        annotation_text=label, annotation_font_size=10,
+                        annotation_font_color=color, annotation_position="right", row=1, col=1)
+
+    # Layout: clean Kite style
     fig.update_layout(
-        height=680,
-        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        height=540,
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font=dict(family="Inter, -apple-system, sans-serif", size=11, color=FONT_CLR),
+        margin=dict(l=0, r=95, t=28, b=0),
         xaxis_rangeslider_visible=False,
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02,
-                "xanchor": "right", "x": 1},
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+                    font=dict(size=10), bgcolor="rgba(255,255,255,0)"),
     )
+    fig.update_xaxes(showgrid=True, gridcolor=GRID_CLR, gridwidth=1,
+                     showline=True, linecolor="#e0e0e0", zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=GRID_CLR, gridwidth=1,
+                     showline=True, linecolor="#e0e0e0",
+                     side="right", zeroline=False, tickformat=",.0f")
+    fig.update_yaxes(row=2, col=1, tickformat=".2s",
+                     title_text="Vol", title_font_size=10, automargin=True)
     return fig
 
+
+
+# ─────────────────────────────────────────────────────────────
+# Backtest section renderer
+# ─────────────────────────────────────────────────────────────
+def _render_backtest_section(st_module) -> None:
+    """
+    Renders the ▶ Run Backtest button and results panel.
+    Runs in a background thread so it never blocks the live feed.
+    """
+    import threading
+
+    # Session state init
+    for key, default in [
+        ("bt_running", False), ("bt_status", "Idle"),
+        ("bt_log", []),        ("bt_result", None),
+        ("bt_error",  None),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    st.markdown("---")
+    st.subheader("📊 Strategy Backtest — NIFTY & BANKNIFTY")
+
+    if not BACKTEST_AVAILABLE:
+        st.warning(
+            "backtest_engine.py not found at agents/backtest_engine.py. "
+            "Copy agents/backtest_engine.py into your agents/ folder."
+        )
+        return
+
+    col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+    bt_interval = col_cfg1.selectbox(
+        "Backtest interval", ["1min", "5min", "15min", "1day"],
+        index=2, key="bt_interval"
+    )
+    bt_start = col_cfg2.text_input("Start date", "2024-06-01", key="bt_start")
+    bt_end   = col_cfg3.text_input("End date",   "2025-06-01", key="bt_end")
+
+    col_run, col_status = st.columns([1, 3])
+    with col_run:
+        run_clicked = st.button(
+            "▶ Run Backtest",
+            disabled=bool(st.session_state.get("bt_running")),
+        )
+
+    with col_status:
+        status_icon = {
+            "Idle":     "⚪",
+            "Started":  "🔄",
+            "Finished": "✅",
+            "Failed":   "❌",
+        }.get(st.session_state.get("bt_status", "Idle"), "⚪")
+        st.markdown(
+            "**Status:** {} {}".format(
+                status_icon, st.session_state.get("bt_status", "Idle")
+            )
+        )
+
+    if run_clicked and not st.session_state.get("bt_running"):
+        def _worker():
+            try:
+                st.session_state["bt_running"] = True
+                st.session_state["bt_status"]  = "Started"
+                st.session_state["bt_log"]     = ["▶ Backtest started…"]
+                st.session_state["bt_error"]   = None
+
+                _, res = run_backtest_and_module(
+                    instruments=["NIFTY", "BANKNIFTY"],
+                    interval=st.session_state.get("bt_interval", "15min"),
+                    start=st.session_state.get("bt_start", "2024-06-01"),
+                    end=st.session_state.get("bt_end",   "2025-06-01"),
+                )
+                st.session_state["bt_result"] = res
+                st.session_state["bt_status"] = "Finished"
+                st.session_state["bt_log"].append("✅ Backtest complete.")
+            except Exception as err:
+                st.session_state["bt_error"]  = str(err)
+                st.session_state["bt_status"] = "Failed"
+                st.session_state["bt_log"].append("❌ Error: {}".format(err))
+            finally:
+                st.session_state["bt_running"] = False
+
+        threading.Thread(target=_worker, daemon=True).start()
+        st.info("Backtest running in background — refresh panel to see results.")
+
+    # Log
+    if st.session_state.get("bt_log"):
+        with st.expander("Backtest log", expanded=False):
+            for line in st.session_state["bt_log"][-30:]:
+                st.text(line)
+
+    # Error
+    if st.session_state.get("bt_error"):
+        st.error("Backtest error: {}".format(st.session_state["bt_error"]))
+
+    # Results
+    if st.session_state.get("bt_result") is not None:
+        try:
+            from agents.backtest_engine import render_backtest_panel
+            render_backtest_panel(st.session_state["bt_result"])
+        except Exception as e:
+            st.warning("Could not render backtest panel: {}".format(e))
+            # Fallback: show raw summary dict
+            res = st.session_state["bt_result"]
+            results_dict = res.get("results", {})
+            for key, val in results_dict.items():
+                summ = val.get("summary", {})
+                if summ and summ.get("total_trades", 0) > 0:
+                    st.markdown("**{}** — Win: {} | Net P&L: {} | Prob: {}".format(
+                        key,
+                        summ.get("win_rate", "—"),
+                        summ.get("net_pnl",  "—"),
+                        summ.get("probability", "—"),
+                    ))
+
+
+# ─────────────────────────────────────────────────────────────
+# GHOST strategy section renderer
+# ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def _fetch_prev_day_levels(underlying: str):
+    """
+    Fetch previous trading day's High/Low for PDH/PDL.
+    Uses yfinance ^NSEI / ^NSEBANK as a reliable daily-bar source.
+    Cached 5 minutes — PDH/PDL don't change intraday.
+    """
+    import yfinance as yf
+    ticker_map = {
+        "NIFTY":     "^NSEI",
+        "BANKNIFTY": "^NSEBANK",
+        "SENSEX":    "^BSESN",
+    }
+    cu = "NIFTY"
+    u  = (underlying or "NIFTY").upper()
+    if "BANK" in u:
+        cu = "BANKNIFTY"
+    elif "SENSEX" in u:
+        cu = "SENSEX"
+
+    try:
+        hist = yf.Ticker(ticker_map.get(cu, "^NSEI")).history(period="5d")
+        if len(hist) >= 2:
+            prev = hist.iloc[-2]
+            return float(prev["High"]), float(prev["Low"]), cu
+    except Exception:
+        pass
+
+    # Fallback approximate levels (June 2026 range)
+    fallback = {
+        "NIFTY":     (24850.0, 24550.0),
+        "BANKNIFTY": (54850.0, 53900.0),
+        "SENSEX":    (81500.0, 80800.0),
+    }
+    pdh, pdl = fallback.get(cu, (24850.0, 24550.0))
+    return pdh, pdl, cu
+
+
+def _compute_ghost_signal(candles, selected_state, underlying, news_bias):
+    """
+    Pure computation — no Streamlit calls. Returns (signal, instrument, pdh, pdl).
+    Called before chart render so the signal can be overlaid on the chart.
+    Returns None signal if preconditions not met.
+    """
+    if not GHOST_AVAILABLE:
+        return None, None, None, None
+
+    agent = st.session_state.get("agent")
+    if agent is None or not hasattr(agent, "get_price_history"):
+        return None, None, None, None
+
+    u = (underlying or "NIFTY").upper()
+    instrument = "BANKNIFTY" if "BANK" in u else "SENSEX" if "SENSEX" in u else "NIFTY"
+
+    token = None
+    for tok, label in getattr(agent, "live_state", {}).items():
+        lbl = (label.get("label") or label.get("symbol") or "").upper()
+        if instrument in lbl.replace(" ", ""):
+            token = tok
+            break
+    if token is None and agent.live_state:
+        token = list(agent.live_state.keys())[0]
+    if token is None:
+        return None, instrument, None, None
+
+    history = agent.get_price_history(token)
+    if not history or len(history) < 30:
+        return None, instrument, None, None
+
+    df15 = build_candles(history, "15min")
+    df5  = build_candles(history, "5min")
+    if df15.empty or df5.empty or len(df15) < 2 or len(df5) < 2:
+        return None, instrument, None, None
+
+    def _to_ohlcv(df):
+        return df.rename(columns={
+            "open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"
+        }).set_index("timestamp")[["Open","High","Low","Close","Volume"]]
+
+    df15_ohlc = _to_ohlcv(df15)
+    df5_ohlc  = _to_ohlcv(df5)
+    pdh, pdl, _ = _fetch_prev_day_levels(underlying)
+    ltp = float(
+        selected_state.get("last_price") or selected_state.get("ltp")
+        or df5_ohlc["Close"].iloc[-1]
+    )
+
+    buyers_ratio = selected_state.get("buyers_ratio")
+    engine = GhostStrategyEngine(instrument=instrument)
+    signal = engine.evaluate(
+        df_15min=df15_ohlc, df_5min=df5_ohlc,
+        prev_day_high=pdh, prev_day_low=pdl,
+        current_ltp=ltp, news_bias=news_bias,
+        buyers_ratio=float(buyers_ratio) if buyers_ratio is not None else None,
+    )
+    return signal, instrument, pdh, pdl
+
+
+def _render_ghost_section(st_module, candles, selected_state, underlying, news_bias):
+    """
+    Renders the GHOST strategy panel including:
+    - Diagnostic "why no trade" panel when waiting
+    - Market depth confluence badge
+    - DailyRiskGuard discipline enforcer
+    - Signal details via render_ghost_panel()
+    """
+    st.markdown("---")
+    st.subheader("👻 GHOST — Single Best Strategy")
+    st.caption(
+        "Liquidity Sweep → Order Block → FVG → 5-min Confirmation. "
+        "SMC + psychology filters. PDH/PDL sweep trap reversal."
+    )
+
+    if not GHOST_AVAILABLE:
+        st.info("ghost_strategy.py not found — check agents/ folder.")
+        return
+
+    signal, instrument, pdh, pdl = st.session_state.get("_ghost_signal_cache", (None,None,None,None))
+
+    if signal is None:
+        agent = st.session_state.get("agent")
+        if agent is None or not hasattr(agent, "get_price_history"):
+            st.info("Connect WebSocket to enable GHOST live signals.")
+            return
+
+        u = (underlying or "NIFTY").upper()
+        instrument = "BANKNIFTY" if "BANK" in u else "SENSEX" if "SENSEX" in u else "NIFTY"
+        token = None
+        for tok, label in getattr(agent, "live_state", {}).items():
+            lbl = (label.get("label") or label.get("symbol") or "").upper()
+            if instrument in lbl.replace(" ", ""):
+                token = tok
+                break
+        if token is None and agent.live_state:
+            token = list(agent.live_state.keys())[0]
+
+        history = agent.get_price_history(token) if token else []
+        if not history or len(history) < 30:
+            st.info(f"Waiting for ticks — need 30+, have {len(history) if history else 0}.")
+            return
+
+        df15 = build_candles(history, "15min")
+        df5  = build_candles(history, "5min")
+        if df15.empty or df5.empty or len(df15) < 2 or len(df5) < 2:
+            st.info("Not enough candles for GHOST yet (need ≥2 of each timeframe).")
+            return
+
+        def _to_ohlcv(df):
+            return df.rename(columns={
+                "open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"
+            }).set_index("timestamp")[["Open","High","Low","Close","Volume"]]
+
+        df15_ohlc = _to_ohlcv(df15)
+        df5_ohlc  = _to_ohlcv(df5)
+        pdh, pdl, _ = _fetch_prev_day_levels(underlying)
+        ltp = float(
+            selected_state.get("last_price") or selected_state.get("ltp")
+            or df5_ohlc["Close"].iloc[-1]
+        )
+        buyers_ratio = selected_state.get("buyers_ratio")
+        engine = GhostStrategyEngine(instrument=instrument)
+        signal = engine.evaluate(
+            df_15min=df15_ohlc, df_5min=df5_ohlc,
+            prev_day_high=pdh, prev_day_low=pdl,
+            current_ltp=ltp, news_bias=news_bias,
+            buyers_ratio=float(buyers_ratio) if buyers_ratio is not None else None,
+            prev_day_close=pdl_extra if "pdl_extra" in dir() else None,
+        )
+        st.session_state["_ghost_signal_cache"] = (signal, instrument, pdh, pdl)
+
+    # ── Market Depth confluence badge
+    buyers_ratio = selected_state.get("buyers_ratio")
+    depth_raw    = selected_state.get("depth", {})
+    if buyers_ratio is not None:
+        buy_pct = float(buyers_ratio)
+        sell_pct = 100.0 - buy_pct
+        if signal and signal.direction.value == "BEAR":
+            if buy_pct <= 40:
+                depth_badge = f"✅ Depth confirms BEAR — only {buy_pct:.0f}% buyers (sellers dominate)"
+                depth_color = "normal"
+            elif buy_pct >= 65:
+                depth_badge = f"⚠️ Bid wall alert — {buy_pct:.0f}% buyers. Smart money may absorb this sell-off."
+                depth_color = "off"
+            else:
+                depth_badge = f"◽ Depth neutral — {buy_pct:.0f}% buyers / {sell_pct:.0f}% sellers"
+                depth_color = "off"
+        elif signal and signal.direction.value == "BULL":
+            if buy_pct >= 60:
+                depth_badge = f"✅ Depth confirms BULL — {buy_pct:.0f}% buyers dominating"
+                depth_color = "normal"
+            elif buy_pct <= 35:
+                depth_badge = f"⚠️ Ask wall alert — only {buy_pct:.0f}% buyers. Supply overhead."
+                depth_color = "off"
+            else:
+                depth_badge = f"◽ Depth neutral — {buy_pct:.0f}% buyers / {sell_pct:.0f}% sellers"
+                depth_color = "off"
+        else:
+            depth_badge = f"📊 Market Depth — {buy_pct:.0f}% buyers / {sell_pct:.0f}% sellers"
+            depth_color = "off"
+        st.caption(depth_badge)
+
+    # ── Diagnostic "Why no trade today?" panel
+    if signal is not None and not signal.actionable:
+        with st.expander("🔍 Why no trade? — GHOST diagnostic", expanded=True):
+            ltp_now = float(selected_state.get("last_price") or selected_state.get("ltp") or 0)
+            d_col1, d_col2, d_col3, d_col4, d_col5, d_col6 = st.columns(6)
+            d_col1.metric("PDH", f"{pdh:.0f}" if pdh else "—")
+            d_col2.metric("PDL", f"{pdl:.0f}" if pdl else "—")
+            d_col3.metric("Today H", f"{signal.today_high:.0f}" if signal.today_high else "—")
+            d_col4.metric("Today L", f"{signal.today_low:.0f}" if signal.today_low else "—")
+            d_col5.metric("VWAP", f"{signal.vwap:.0f}" if signal.vwap else "—",
+                          signal.vwap_position if signal.vwap_position else "")
+            d_col6.metric("Phase", signal.phase.value.replace("_", " ") if signal.phase else "—")
+            if signal.gap_type and signal.gap_type != "FLAT":
+                st.info(f"📊 **{signal.gap_type}** today ({signal.gap_pct:+.2f}%) — "
+                        f"GHOST uses Today's High/Low ({signal.today_high:.0f}/{signal.today_low:.0f}) "
+                        f"as sweep levels since price gapped past PDH/PDL.")
+            if signal.setup_type:
+                setup_labels = {
+                    "COMBINED": "🏆 COMBINED — PDH/PDL sweep + VWAP (highest conviction)",
+                    "PDH_PDL_SWEEP": "📍 PDH/PDL Sweep trap",
+                    "TODAY_HIGH_LOW_SWEEP": "📍 Today's High/Low sweep (gap-day mode)",
+                    "VWAP_REJECTION": "〰️ VWAP Rejection — reduce size vs normal setups",
+                }
+                st.caption("Setup type: " + setup_labels.get(signal.setup_type, signal.setup_type))
+
+            reasons = []
+            if pdh and pdl and ltp_now:
+                inside = pdl < ltp_now < pdh
+                if inside:
+                    reasons.append(
+                        f"⏳ **Price inside PDH/PDL range** — GHOST waits for a breakout "
+                        f"above PDH ({pdh:.0f}) or below PDL ({pdl:.0f}) to trigger a "
+                        f"retail trap. Current price {ltp_now:.0f} is {min(ltp_now-pdl, pdh-ltp_now):.0f} pts "
+                        f"away from the nearest level."
+                    )
+                elif ltp_now >= pdh:
+                    reasons.append(
+                        f"📍 Price is **above PDH {pdh:.0f}** (bullish breakout zone). "
+                        f"GHOST is watching for a liquidity sweep of PDH followed by a "
+                        f"rejection candle on 15-min to confirm a PE (bear) setup."
+                    )
+                else:
+                    reasons.append(
+                        f"📍 Price is **below PDL {pdl:.0f}** (bearish breakdown zone). "
+                        f"GHOST is watching for a liquidity sweep of PDL followed by a "
+                        f"rejection candle on 15-min to confirm a CE (bull) setup."
+                    )
+
+            if signal.phase and "NO_TRADE" in str(signal.phase):
+                reasons.append(
+                    "🛑 **Hard stop gate fired** — low trap quality combined with news "
+                    "supporting the breakout direction (not our reversal). Capital protection mode."
+                )
+            if signal.session_warning:
+                reasons.append(signal.session_warning)
+            if signal.trap_quality == "LOW":
+                reasons.append("⚠️ Trap quality is LOW — sweep volume was thin (fake wick risk)")
+            if signal.ob_high == 0 or not signal.ob_high:
+                reasons.append("🔍 No Order Block found yet in the current 15-min structure")
+
+            wait_msg = getattr(signal, "wait_message", "")
+            if wait_msg:
+                reasons.append(f"💬 Engine says: *{wait_msg}*")
+
+            if not reasons:
+                reasons.append("⏳ Conditions not fully aligned yet. Waiting for next setup.")
+
+            for r in reasons:
+                st.markdown(r)
+
+            if signal.confluence_list:
+                st.markdown("**Confluence so far:**")
+                for c in signal.confluence_list:
+                    st.markdown(f"  {c}")
+
+    # ── Daily Risk Guard
+    if "ghost_guard" not in st.session_state:
+        st.session_state["ghost_guard"] = DailyRiskGuard()
+    guard = st.session_state["ghost_guard"]
+
+    gcol1, gcol2 = st.columns([3, 1])
+    with gcol1:
+        st.caption("🛡️ " + guard.status_line())
+    with gcol2:
+        if st.button("Reset day", key="ghost_guard_reset"):
+            st.session_state["ghost_guard"] = DailyRiskGuard()
+            st.session_state.pop("_ghost_signal_cache", None)
+            st.rerun()
+
+    if signal is not None and signal.actionable and not guard.can_trade(signal.confidence):
+        st.error(guard.block_reason())
+        with st.expander("Signal details (informational only — blocked)", expanded=False):
+            render_ghost_panel(signal, instrument=instrument)
+        return
+
+    if signal is not None:
+        render_ghost_panel(signal, instrument=instrument)
+
+    # ── Record trade outcome
+    if signal is not None and signal.actionable:
+        with st.expander("📝 Record trade outcome (updates Daily Risk Guard)", expanded=False):
+            st.caption("Log after trade closes to enforce cooldown/halt rules.")
+            outcome_pnl = st.number_input(
+                "P&L for this trade (₹, negative if loss)",
+                value=0.0, step=50.0, key="ghost_outcome_pnl"
+            )
+            if st.button("Log outcome", key="ghost_log_outcome"):
+                guard.record_trade(outcome_pnl)
+                st.session_state.pop("_ghost_signal_cache", None)
+                st.success("Logged ₹{:+,.0f}. {}".format(outcome_pnl, guard.status_line()))
+                st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 # How-to expander
@@ -326,9 +835,7 @@ with st.sidebar:
                                  type="password")
     token_list   = st.text_input(
         "Token List",
-        # include NIFTY and BANKNIFTY futures by default so the dashboard
-        # shows both indices and their strategy panels out-of-the-box
-        value=os.getenv("SMARTAPI_TOKEN_LIST", "NIFTY 50=1:99926000,BANKNIFTY=1:260105,SENSEX=3:99919000"),
+        value=os.getenv("SMARTAPI_TOKEN_LIST", "NIFTY 50=1:99926000,SENSEX=3:99919000"),
         help=(
             "Format: LABEL=exchangeType:token  "
             "Common tokens — "
@@ -366,16 +873,13 @@ LTP only during low-activity periods.
     candle_interval = st.selectbox(
         "Candle Interval",
         ["1min", "5min", "15min", "1day"],
-        index=0,
-        help="Only supported intervals for options strategies: 1min, 5min, 15min and 1day.",
+        index=2,  # default 15min
     )
     auto_refresh     = st.checkbox("Live auto refresh", value=True)
     refresh_seconds  = st.number_input("Refresh seconds", min_value=1, max_value=10, value=1, step=1)
-    news_query       = st.text_input(
-        "News Query",
-        value=os.getenv("MARKET_NEWS_QUERY",
-                        "Nifty Sensex Indian stock market options latest news"),
-    )
+    # News fetched live from RSS feeds — no query string needed
+    news_query = "live_rss"
+    st.caption("📰 News: Live RSS from ET, Moneycontrol, Business Standard, LiveMint")
     st.markdown("**Step 1:** Authenticate with your PIN + TOTP and start the WebSocket stream")
     complete_session = st.button("Login & Start WebSocket")
 
@@ -393,6 +897,8 @@ if "last_news_result" not in st.session_state:
     st.session_state["last_news_result"] = None
 if "raw_news_sentiment" not in st.session_state:
     st.session_state["raw_news_sentiment"] = 0
+if "raw_banknifty_sentiment" not in st.session_state:
+    st.session_state["raw_banknifty_sentiment"] = 0
 
 status_container  = st.container()
 metrics_container = st.container()
@@ -573,8 +1079,21 @@ else:
                 )
                 metric_cols[6].metric("Feed Delay", delay_text)
 
+                # ── Chart overlay toggles (sidebar)
+                with st.sidebar.expander("📈 Chart overlays", expanded=False):
+                    show_ema = st.checkbox("EMA 9 / 20", value=False, key="chart_ema")
+                    show_vwap = st.checkbox("VWAP", value=False, key="chart_vwap")
+                    show_sr  = st.checkbox("Support / Resistance", value=False, key="chart_sr")
+                    show_ghost_lines = st.checkbox("GHOST levels on chart", value=True, key="chart_ghost")
+
+                # Fetch cached GHOST signal for chart overlay (computed later in _render_ghost_section)
+                _ghost_sig_cache = st.session_state.get("_ghost_signal_cache")
+                _chart_ghost_signal = _ghost_sig_cache[0] if _ghost_sig_cache and show_ghost_lines else None
+
                 st.plotly_chart(
-                    build_trading_chart(candles, selected_token),
+                    build_trading_chart(candles, selected_token,
+                                        ghost_signal=_chart_ghost_signal,
+                                        show_ema=show_ema, show_vwap=show_vwap, show_sr=show_sr),
                     use_container_width=True,
                 )
 
@@ -590,56 +1109,21 @@ else:
                     brain           = _brain,
                     news_bias       = news_bias,
                 )
-                # Backtest panel integration (run asynchronously)
-                def _start_backtest_async(instruments=None, interval="1day"):
-                    import threading
-                    def _worker():
-                        try:
-                            st.session_state["bt_running"] = True
-                            st.session_state["bt_status"] = "Started"
-                            st.session_state["bt_log"] = ["Backtest started"]
-                            module, res = run_backtest_and_module(instruments=instruments, interval=interval)
-                            st.session_state["bt_result"] = res
-                            st.session_state["bt_status"] = "Finished"
-                            st.session_state["bt_log"].append("Backtest finished successfully")
-                        except Exception as err:
-                            st.session_state["bt_error"] = str(err)
-                            st.session_state["bt_status"] = "Failed"
-                            st.session_state["bt_log"].append(f"Error: {err}")
-                        finally:
-                            st.session_state["bt_running"] = False
 
-                    thread = threading.Thread(target=_worker, daemon=True)
-                    thread.start()
+                # ── GHOST strategy — single best setup (SMC + liquidity sweep)
+                if GHOST_AVAILABLE:
+                    _render_ghost_section(
+                        st, candles, selected_state,
+                        underlying=(
+                            selected_state.get("label")
+                            or selected_state.get("symbol")
+                            or selected_token
+                        ),
+                        news_bias=news_bias,
+                    )
 
-                if "bt_running" not in st.session_state:
-                    st.session_state["bt_running"] = False
-                    st.session_state["bt_status"] = "Idle"
-                    st.session_state["bt_log"] = []
-                    st.session_state["bt_result"] = None
-                    st.session_state["bt_error"] = None
-
-                col_run_a, col_run_b = st.columns([1, 3])
-                with col_run_a:
-                    if st.button("▶ Run Backtest Async"):
-                        if not st.session_state.get("bt_running", False):
-                            _start_backtest_async(instruments=["NIFTY", "BANKNIFTY"], interval="1day")
-                            st.success("Backtest started in background — Refresh panel to see updates.")
-                        else:
-                            st.info("Backtest already running.")
-                with col_run_b:
-                    st.markdown(f"**Status:** {st.session_state.get('bt_status','Idle')}")
-                    if st.session_state.get("bt_log"):
-                        with st.expander("Backtest Log", expanded=False):
-                            for line in st.session_state.get("bt_log", [])[-50:]:
-                                st.text(line)
-
-                # If finished, render results
-                if st.session_state.get("bt_result") is not None:
-                    from agents.backtest_engine import render_backtest_panel
-                    render_backtest_panel(st.session_state.get("bt_result"))
-                if st.session_state.get("bt_error"):
-                    st.error(f"Backtest error: {st.session_state.get('bt_error')}")
+                # ── Backtest panel
+                _render_backtest_section(st)
 
                 with right:
                     st.subheader("Levels & Pattern")
